@@ -1,0 +1,63 @@
+# --- Pliki danych i duże pliki (Twoja baza wypadków) ---
+*.csv
+*.tsv
+*.json
+*.sqlite3
+# Jeśli przechowujesz modele (np. LightGBM, MLP) po wytrenowaniu, też ich nie wrzucaj:
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.onnx
+
+# --- Środowisko wirtualne i pakiety ---
+.venv/
+venv/
+ENV/
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- PyCharm / JetBrains IDE ---
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# --- Pamięć podręczna Pythona (Byte-compiled / optimize / __pycache__) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Systemowe śmieci (Linux / macOS) ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.desktop
+.directory
+*~
+*.bak
+*.swp
+*.swo
