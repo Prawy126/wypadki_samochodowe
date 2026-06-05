@@ -61,3 +61,5 @@ __pycache__/
 *.bak
 *.swp
 *.swo
+
+lgbm_model.txt
