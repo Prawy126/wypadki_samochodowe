@@ -16,25 +16,37 @@ OUTPUT_DIR = ROOT_DIR / "uczenie" / "outputs"
 # MLP z Entity Embeddings
 # ---------------------------------------------------------------------------
 MLP = dict(
-    hidden_dims  = [512, 512, 256, 128],  # wymiary warstw ukrytych
-    dropout      = 0.25,
+    # Mniej warstw/parametrów = mniejsza skłonność do uczenia na pamięć
+    hidden_dims  = [512, 256, 128],  # wymiary warstw ukrytych (było [512,512,256,128])
+    dropout      = 0.4,              # mocniejsza regularyzacja (było 0.25)
     batch_norm   = True,
     lr           = 1e-3,
     batch_size   = 2048,
     max_epochs   = 100,
-    patience     = 12,       # Early Stopping (val_macro_f1)
-    lr_patience  = 5,        # ReduceLROnPlateau
+    patience     = 7,        # Early Stopping — szybsze zatrzymanie (było 12)
+    lr_patience  = 3,        # ReduceLROnPlateau — szybsza redukcja lr (było 5)
     lr_factor    = 0.5,
-    weight_decay = 1e-4,
+    weight_decay = 5e-4,     # silniejszy L2 (było 1e-4)
     seed         = 42,
     num_workers  = 4,        # DataLoader workers (Linux)
+
+    # ---- Balans klas (kluczowe dla macro F1 vs accuracy) ----
+    # Pełna odwrotność częstości (power=1.0) daje wagi do ~80x i rozwala
+    # accuracy. power<1.0 "spłaszcza" wagi: 0.0 = brak wag, 0.5 = sqrt-balanced.
+    # 0.3-0.5 to zwykle najlepszy kompromis acc <-> macro_f1.
+    class_weight_power = 0.5,
+    class_weight_cap   = 10.0,   # górny limit wagi po normalizacji (None = brak)
+
+    # label_smoothing wprost ogranicza overconfidence → mniejszy rozjazd
+    # train/val loss. To główny środek na przeuczenie tutaj.
+    label_smoothing    = 0.1,
 )
 
 # ---------------------------------------------------------------------------
 # LightGBM
 # ---------------------------------------------------------------------------
 LGBM = dict(
-    n_estimators          = 5000,
+    n_estimators          = 8000,
     learning_rate         = 0.02,
     num_leaves            = 127,
     max_depth             = -1,

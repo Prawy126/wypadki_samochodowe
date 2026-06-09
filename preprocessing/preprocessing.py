@@ -38,23 +38,23 @@ DROP_COLS = [
 
 REQUIRED_COLS = ['Severity', 'Start_Lat', 'Start_Lng', 'Start_Time', 'End_Time']
 
-# Numeric columns to impute & scale (Year intentionally excluded — ordinal cat)
+# Numeric columns to impute & scale
 NUM_COLS_BASE = [
     'Temperature(F)', 'Wind_Chill(F)', 'Humidity(%)', 'Pressure(in)',
     'Visibility(mi)', 'Wind_Speed(mph)', 'Precipitation(in)',
     'Distance(mi)', 'Duration_min', 'Start_Lat', 'Start_Lng',
     'Dist_from_center', 'Hour_sin', 'Hour_cos',
     'DayOfWeek_sin', 'DayOfWeek_cos', 'Month_sin', 'Month_cos',
+    'Year',
 ]
 
 LOG_TRANSFORM_COLS = ['Distance(mi)', 'Precipitation(in)', 'Wind_Speed(mph)', 'Duration_min']
 
 HIGH_MISSING = ['Wind_Chill(F)', 'Precipitation(in)', 'Wind_Speed(mph)']
 
-# Year moved here — treated as ordinal category, not scaled
 CAT_COLS = [
     'Source', 'State', 'City', 'County', 'Timezone',
-    'Wind_Direction', 'Weather_Category', 'Geo_Cluster', 'Year',
+    'Wind_Direction', 'Weather_Category', 'Geo_Cluster',
 ]
 
 BOOL_COLS = [
@@ -320,6 +320,15 @@ def run_preprocessing(input_csv: str, output_dir: str) -> None:
     NUM_COLS = [f'{c}_log' if c in LOG_TRANSFORM_COLS else c for c in NUM_COLS_BASE]
     logger.info("Log1p transformations complete.")
 
+    # Feature schema guardrail: Year must remain numeric, never categorical.
+    if "Year" not in NUM_COLS:
+        raise RuntimeError("Schema error: 'Year' musi być cechą numeryczną.")
+    if "Year" in CAT_COLS:
+        raise RuntimeError("Schema error: 'Year' nie może być cechą kategoryczną.")
+    if set(NUM_COLS).intersection(CAT_COLS):
+        overlap = sorted(set(NUM_COLS).intersection(CAT_COLS))
+        raise RuntimeError(f"Schema error: kolumny jednocześnie num i cat: {overlap}")
+
     # ------------------------------------------------------------------
     # STEP 11 — Scaling Continuous Features (fit on train only)
     # ------------------------------------------------------------------
@@ -457,9 +466,13 @@ def run_preprocessing(input_csv: str, output_dir: str) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_input = os.path.abspath(os.path.join(script_dir, "..", "US_Accidents_1M.csv"))
+    default_output = os.path.abspath(os.path.join(script_dir, "data"))
+
     parser = argparse.ArgumentParser(description="Preprocess US Accidents dataset.")
-    parser.add_argument("--input",      default="../US_Accidents_1M.csv", help="Path to raw CSV")
-    parser.add_argument("--output-dir", default="data",                   help="Output directory")
+    parser.add_argument("--input",      default=default_input, help="Path to raw CSV")
+    parser.add_argument("--output-dir", default=default_output, help="Output directory")
     args = parser.parse_args()
 
     run_preprocessing(input_csv=args.input, output_dir=args.output_dir)

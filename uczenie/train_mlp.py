@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from . import config
+from .calibration import apply_multipliers, save_multipliers, tune_class_multipliers
 from .dataset import AccidentDataset
 from .evaluate import evaluate_model
 from .model_mlp import EntityEmbeddingMLP
@@ -49,6 +50,89 @@ def get_device() -> torch.device:
         device = torch.device("cpu")
         logger.info("GPU niedostępne — trening na CPU (bez AMP).")
     return device
+
+
+# ---------------------------------------------------------------------------
+# Wagi klas (power scaling)
+# ---------------------------------------------------------------------------
+
+def compute_class_weights(
+    class_counts: dict,
+    num_classes: int = 4,
+    power: float = 0.5,
+    cap: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Liczy złagodzone wagi klas z rozkładu treningowego.
+
+    Pełna odwrotność częstości (power=1.0) przy silnym imbalanse daje wagi
+    rzędu kilkudziesięciu i zmusza model do ignorowania klasy większościowej
+    → katastrofalny spadek accuracy. Skalowanie potęgowe spłaszcza te wagi:
+
+        w_i = (N / (K * count_i)) ** power
+
+    następnie normalizujemy do średniej 1.0 (stabilna skala loss) i opcjonalnie
+    przycinamy do 'cap'.
+
+    Args:
+        class_counts : {klasa: liczność} z treningu
+        num_classes  : liczba klas (K)
+        power        : 0.0 = brak wag, 0.5 = sqrt-balanced, 1.0 = pełny balanced
+        cap          : górny limit wagi po normalizacji (None = brak)
+
+    Returns:
+        np.ndarray [K] z wagami float32
+    """
+    counts = np.array(
+        [max(class_counts.get(i, 0), 1) for i in range(num_classes)],
+        dtype=np.float64,
+    )
+    n_total = counts.sum()
+
+    # power=0 → wszystkie wagi równe 1 (brak ważenia)
+    raw = (n_total / (num_classes * counts)) ** power
+    weights = raw / raw.mean()  # normalizacja do średniej 1.0
+
+    if cap is not None:
+        weights = np.minimum(weights, cap)
+
+    return weights.astype(np.float32)
+
+
+def validate_year_feature_schema(metadata: dict, train_ds: AccidentDataset) -> None:
+    """
+    Sprawdza spójność traktowania kolumny Year.
+
+    Year ma być cechą numeryczną. Jeśli wygląda jak zakodowana kategoria
+    (np. 1..8), zatrzymujemy trening z czytelnym komunikatem, żeby uniknąć
+    cichego driftu między preprocessingiem i uczeniem.
+    """
+    num_cols = metadata.get("num_cols", [])
+    cat_cols = metadata.get("cat_cols", [])
+
+    if "Year" in cat_cols or "Year" not in num_cols:
+        raise ValueError(
+            "Niespójna schema: 'Year' musi być w num_cols i nie może być w cat_cols. "
+            "Uruchom preprocessing ponownie."
+        )
+
+    year_idx = num_cols.index("Year")
+    year_vals = train_ds.num[:, year_idx].cpu().numpy()
+
+    # Heurystyka driftu: Year zakodowany jako kategoria zazwyczaj ma mały zakres
+    # dodatnich liczb całkowitych (np. 1..8).
+    is_integer_like = np.allclose(year_vals, np.round(year_vals), atol=1e-6)
+    if is_integer_like:
+        year_min = float(year_vals.min())
+        year_max = float(year_vals.max())
+        year_unique = int(np.unique(year_vals).size)
+        if 0.0 <= year_min and year_max <= 50.0 and year_unique <= 50:
+            raise ValueError(
+                "Wykryto drift danych: kolumna 'Year' wygląda na zakodowaną "
+                f"kategorycznie (min={year_min:.1f}, max={year_max:.1f}, unique={year_unique}). "
+                "Uruchom preprocessing/preprocessing.py ponownie, aby zapisać "
+                "spójne artefakty (Year jako cecha numeryczna)."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +250,33 @@ def _val_epoch(
 
 
 # ---------------------------------------------------------------------------
+# Zbieranie predykcji z DataLoadera
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _collect_probas(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Zwraca (labels [N], probas [N, 4]) dla całego loadera."""
+    model.eval()
+    all_labels = []
+    all_probas = []
+
+    for batch in loader:
+        cat       = batch["cat"].to(device, non_blocking=True)
+        num       = batch["num"].to(device, non_blocking=True)
+        bin_feats = batch["bin"].to(device, non_blocking=True)
+
+        logits = model(cat, num, bin_feats)
+        all_probas.append(torch.softmax(logits, dim=1).cpu().numpy())
+        all_labels.append(batch["label"].numpy())
+
+    return np.concatenate(all_labels), np.concatenate(all_probas)
+
+
+# ---------------------------------------------------------------------------
 # Wykres historii treningu
 # ---------------------------------------------------------------------------
 
@@ -221,7 +332,8 @@ def train_mlp(
         cfg      : hiperparametry (domyślnie config.MLP)
 
     Returns:
-        (model, results_dict) — najlepszy model + metryki na zbiorze testowym
+        (model, [results_raw, results_calibrated]) — najlepszy model + metryki
+        na zbiorze testowym (surowy argmax oraz po kalibracji progów)
     """
     if cfg is None:
         cfg = config.MLP
@@ -245,6 +357,7 @@ def train_mlp(
         f"Train: {len(train_ds):,}  |  Val: {len(val_ds):,}  |  Test: {len(test_ds):,}"
     )
     logger.info(f"Rozkład klas (train): {train_ds.class_counts}")
+    validate_year_feature_schema(metadata, train_ds)
 
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -285,12 +398,23 @@ def train_mlp(
     logger.info(f"Parametry modelu: {model.count_parameters():,}")
     logger.info(f"Wymiar wejściowy: {model.config['input_dim']}")
 
-    # ---- Loss z wagami klas ----
-    class_weights = torch.tensor(
-        [metadata["class_weights"][str(i)] for i in range(4)],
-        dtype=torch.float32,
-    ).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    # ---- Loss z wagami klas (złagodzonymi) ----
+    weights_np = compute_class_weights(
+        train_ds.class_counts,
+        num_classes=4,
+        power=cfg.get("class_weight_power", 0.5),
+        cap=cfg.get("class_weight_cap", None),
+    )
+    class_weights = torch.tensor(weights_np, dtype=torch.float32).to(device)
+    logger.info(
+        f"Wagi klas (power={cfg.get('class_weight_power', 0.5)}, "
+        f"cap={cfg.get('class_weight_cap', None)}): "
+        f"{ {i: round(float(w), 3) for i, w in enumerate(weights_np)} }"
+    )
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=cfg.get("label_smoothing", 0.0),
+    )
 
     # ---- Optymalizator i scheduler ----
     optimizer = torch.optim.AdamW(
@@ -382,31 +506,35 @@ def train_mlp(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    all_preds  = []
-    all_labels = []
-    all_probas = []
+    # Kalibracja progów decyzyjnych — strojona na walidacji (nie na test!)
+    logger.info("Kalibracja progów decyzyjnych na zbiorze walidacyjnym...")
+    val_labels, val_probas = _collect_probas(model, val_loader, device)
+    multipliers, val_f1_raw, val_f1_cal = tune_class_multipliers(val_labels, val_probas)
+    save_multipliers(
+        output_dir / "mlp_calibration.json",
+        multipliers,
+        info={
+            "val_macro_f1_raw":        round(val_f1_raw, 4),
+            "val_macro_f1_calibrated": round(val_f1_cal, 4),
+        },
+    )
 
-    with torch.no_grad():
-        for batch in test_loader:
-            cat       = batch["cat"].to(device)
-            num       = batch["num"].to(device)
-            bin_feats = batch["bin"].to(device)
-            labels    = batch["label"]
+    test_labels, test_probas = _collect_probas(model, test_loader, device)
 
-            logits = model(cat, num, bin_feats)
-            proba  = torch.softmax(logits, dim=1).cpu().numpy()
-
-            all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-            all_labels.extend(labels.numpy())
-            all_probas.extend(proba)
-
-    results = evaluate_model(
-        y_true     = np.array(all_labels),
-        y_pred     = np.array(all_preds),
-        y_proba    = np.array(all_probas),
+    results_raw = evaluate_model(
+        y_true     = test_labels,
+        y_pred     = test_probas.argmax(axis=1),
+        y_proba    = test_probas,
         model_name = "MLP (Entity Embeddings)",
+        output_dir = str(output_dir),
+    )
+    results_cal = evaluate_model(
+        y_true     = test_labels,
+        y_pred     = apply_multipliers(test_probas, multipliers),
+        y_proba    = test_probas,
+        model_name = "MLP + kalibracja",
         output_dir = str(output_dir),
     )
 
     logger.info(f"Trening MLP zakończony. Najlepszy val_macro_f1={best_val_f1:.4f}")
-    return model, results
+    return model, [results_raw, results_cal]

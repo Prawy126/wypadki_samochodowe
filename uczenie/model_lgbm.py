@@ -19,6 +19,7 @@ import pandas as pd
 from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 
 from . import config
+from .calibration import apply_multipliers, save_multipliers, tune_class_multipliers
 from .evaluate import evaluate_model
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,12 @@ def _load_data(
     feature_cols = metadata["num_cols"] + metadata["cat_cols"] + metadata["bin_cols"]
     all_cols     = [target_col] + feature_cols
 
+    if "Year" in metadata.get("cat_cols", []) or "Year" not in metadata.get("num_cols", []):
+        raise ValueError(
+            "Niespójna schema: 'Year' musi być cechą numeryczną (num_cols), "
+            "a nie kategoryczną. Uruchom preprocessing ponownie."
+        )
+
     logger.info("Wczytywanie danych dla LightGBM...")
     train_df = pd.read_csv(data_dir / "train_preprocessed.csv.gz", compression="gzip", usecols=all_cols)
     val_df   = pd.read_csv(data_dir / "val_preprocessed.csv.gz",   compression="gzip", usecols=all_cols)
@@ -54,6 +61,19 @@ def _load_data(
     X_train, y_train = train_df[feature_cols], train_df[target_col].values
     X_val,   y_val   = val_df[feature_cols],   val_df[target_col].values
     X_test,  y_test  = test_df[feature_cols],  test_df[target_col].values
+
+    # Drift guard: Year zakodowany jako kategoria (np. 1..8) to błąd schemy.
+    year_vals = X_train["Year"].to_numpy()
+    if np.allclose(year_vals, np.round(year_vals), atol=1e-6):
+        year_min = float(year_vals.min())
+        year_max = float(year_vals.max())
+        year_unique = int(np.unique(year_vals).size)
+        if 0.0 <= year_min and year_max <= 50.0 and year_unique <= 50:
+            raise ValueError(
+                "Wykryto drift danych: kolumna 'Year' wygląda na zakodowaną "
+                f"kategorycznie (min={year_min:.1f}, max={year_max:.1f}, unique={year_unique}). "
+                "Uruchom preprocessing/preprocessing.py ponownie."
+            )
 
     logger.info(f"Train: {X_train.shape}  |  Val: {X_val.shape}  |  Test: {X_test.shape}")
     return X_train, y_train, X_val, y_val, X_test, y_test, feature_cols
@@ -108,7 +128,8 @@ def train_lgbm(
         cfg      : hiperparametry (domyślnie config.LGBM)
 
     Returns:
-        (model, results_dict) — wytrenowany model + metryki na zbiorze testowym
+        (model, [results_raw, results_calibrated]) — wytrenowany model + metryki
+        na zbiorze testowym (surowy argmax oraz po kalibracji progów)
     """
     if cfg is None:
         cfg = config.LGBM
@@ -170,17 +191,36 @@ def train_lgbm(
     # ---- Feature importance ----
     _plot_feature_importance(model, feature_cols, output_dir)
 
+    # ---- Kalibracja progów decyzyjnych (strojona na walidacji) ----
+    logger.info("Kalibracja progów decyzyjnych na zbiorze walidacyjnym...")
+    val_proba = model.predict_proba(X_val)
+    multipliers, val_f1_raw, val_f1_cal = tune_class_multipliers(y_val, val_proba)
+    save_multipliers(
+        output_dir / "lgbm_calibration.json",
+        multipliers,
+        info={
+            "val_macro_f1_raw":        round(val_f1_raw, 4),
+            "val_macro_f1_calibrated": round(val_f1_cal, 4),
+        },
+    )
+
     # ---- Ewaluacja ----
     logger.info("Ewaluacja LightGBM na zbiorze testowym...")
-    y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)
 
-    results = evaluate_model(
+    results_raw = evaluate_model(
         y_true     = y_test,
-        y_pred     = y_pred.astype(int),
+        y_pred     = y_proba.argmax(axis=1),
         y_proba    = y_proba,
         model_name = "LightGBM",
         output_dir = str(output_dir),
     )
+    results_cal = evaluate_model(
+        y_true     = y_test,
+        y_pred     = apply_multipliers(y_proba, multipliers),
+        y_proba    = y_proba,
+        model_name = "LightGBM + kalibracja",
+        output_dir = str(output_dir),
+    )
 
-    return model, results
+    return model, [results_raw, results_cal]

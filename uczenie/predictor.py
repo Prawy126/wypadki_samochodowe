@@ -21,10 +21,32 @@ import joblib
 import numpy as np
 import torch
 
+from .calibration import load_multipliers
 from .model_mlp import EntityEmbeddingMLP
 from . import config
 
 logger = logging.getLogger(__name__)
+
+
+def _calibrated_result(proba: np.ndarray, multipliers: Optional[np.ndarray]) -> Dict:
+    """
+    Buduje wynik predykcji. Gdy dostępne są mnożniki kalibracji, klasa jest
+    wybierana z przeważonych prawdopodobieństw (przesunięta granica decyzyjna),
+    a zwracane prawdopodobieństwa są renormalizowane — spójne z wybraną klasą.
+    """
+    proba = np.asarray(proba, dtype=np.float64)
+    if multipliers is not None:
+        proba = proba * multipliers
+        proba = proba / proba.sum()
+
+    pred_class = int(np.argmax(proba))
+    return {
+        "class":         pred_class,
+        "label":         config.SEVERITY_LABELS[pred_class],
+        "probabilities": proba.tolist(),
+        "confidence":    float(proba.max()),
+    }
+
 
 # ---------------------------------------------------------------------------
 # MLP Predictor
@@ -43,11 +65,13 @@ class AccidentPredictor:
         model: EntityEmbeddingMLP,
         metadata: dict,
         device: torch.device,
+        multipliers: Optional[np.ndarray] = None,
     ):
-        self.model    = model.to(device)
+        self.model       = model.to(device)
         self.model.eval()
-        self.metadata = metadata
-        self.device   = device
+        self.metadata    = metadata
+        self.device      = device
+        self.multipliers = multipliers
 
         self.num_cols = metadata["num_cols"]
         self.cat_cols = metadata["cat_cols"]
@@ -84,11 +108,17 @@ class AccidentPredictor:
         )
         model.load_state_dict(checkpoint["model_state_dict"])
 
+        multipliers = load_multipliers(
+            Path(checkpoint_path).parent / "mlp_calibration.json"
+        )
+        if multipliers is not None:
+            logger.info(f"Kalibracja progów MLP: w={np.round(multipliers, 3).tolist()}")
+
         logger.info(
             f"Załadowano checkpoint MLP: epoch={checkpoint['epoch']}, "
             f"val_macro_f1={checkpoint['best_val_f1']:.4f}, device={device}"
         )
-        return cls(model, metadata, device)
+        return cls(model, metadata, device, multipliers=multipliers)
 
     def predict(self, row: Dict) -> Dict:
         """
@@ -117,15 +147,8 @@ class AccidentPredictor:
         cat_t = torch.tensor(cat_arr).to(self.device)
         bin_t = torch.tensor(bin_arr).to(self.device)
 
-        proba      = self.model.predict_proba(cat_t, num_t, bin_t)[0].cpu().numpy().tolist()
-        pred_class = int(np.argmax(proba))
-
-        return {
-            "class":         pred_class,
-            "label":         config.SEVERITY_LABELS[pred_class],
-            "probabilities": proba,
-            "confidence":    max(proba),
-        }
+        proba = self.model.predict_proba(cat_t, num_t, bin_t)[0].cpu().numpy()
+        return _calibrated_result(proba, self.multipliers)
 
     def predict_batch(self, rows: List[Dict]) -> List[Dict]:
         """Predykcja dla listy przykładów (np. z DataFrame.to_dict('records'))."""
@@ -156,9 +179,10 @@ class LGBMPredictor:
     Takie samo API jak AccidentPredictor — wymienne w GUI.
     """
 
-    def __init__(self, model, metadata: dict):
-        self.model    = model
-        self.metadata = metadata
+    def __init__(self, model, metadata: dict, multipliers: Optional[np.ndarray] = None):
+        self.model       = model
+        self.metadata    = metadata
+        self.multipliers = multipliers
 
         self.num_cols = metadata["num_cols"]
         self.cat_cols = metadata["cat_cols"]
@@ -179,8 +203,13 @@ class LGBMPredictor:
             metadata   : słownik z metadata.json
         """
         model = joblib.load(model_path)
+        multipliers = load_multipliers(
+            Path(model_path).parent / "lgbm_calibration.json"
+        )
+        if multipliers is not None:
+            logger.info(f"Kalibracja progów LGBM: w={np.round(multipliers, 3).tolist()}")
         logger.info(f"Załadowano model LightGBM: {model_path}")
-        return cls(model, metadata)
+        return cls(model, metadata, multipliers=multipliers)
 
     def predict(self, row: Dict) -> Dict:
         """Predykcja dla jednego przykładu (identyczne API jak AccidentPredictor)."""
@@ -192,15 +221,8 @@ class LGBMPredictor:
         for col in self.cat_cols:
             row_df[col] = row_df[col].astype(int)
 
-        proba      = self.model.predict_proba(row_df)[0].tolist()
-        pred_class = int(np.argmax(proba))
-
-        return {
-            "class":         pred_class,
-            "label":         config.SEVERITY_LABELS[pred_class],
-            "probabilities": proba,
-            "confidence":    max(proba),
-        }
+        proba = self.model.predict_proba(row_df)[0]
+        return _calibrated_result(proba, self.multipliers)
 
     def predict_batch(self, rows: List[Dict]) -> List[Dict]:
         """Predykcja wsadowa (bardziej wydajna niż pętla po predict())."""
@@ -210,18 +232,8 @@ class LGBMPredictor:
         for col in self.cat_cols:
             rows_df[col] = rows_df[col].astype(int)
 
-        probas      = self.model.predict_proba(rows_df)
-        pred_classes = probas.argmax(axis=1)
-
-        return [
-            {
-                "class":         int(pred_classes[i]),
-                "label":         config.SEVERITY_LABELS[int(pred_classes[i])],
-                "probabilities": probas[i].tolist(),
-                "confidence":    float(probas[i].max()),
-            }
-            for i in range(len(rows))
-        ]
+        probas = self.model.predict_proba(rows_df)
+        return [_calibrated_result(probas[i], self.multipliers) for i in range(len(rows))]
 
     def get_metadata(self) -> dict:
         """Zwraca metadane modelu — identyczne API jak AccidentPredictor.get_metadata()."""

@@ -135,7 +135,7 @@ Przykłady:
         logger.info("=" * 60)
         from uczenie.train_mlp import train_mlp
         _, mlp_results = train_mlp(metadata)
-        results_list.append(mlp_results)
+        results_list.extend(mlp_results)
 
     # ---- LightGBM ----
     if args.model in ("lgbm", "both"):
@@ -144,7 +144,7 @@ Przykłady:
         logger.info("=" * 60)
         from uczenie.model_lgbm import train_lgbm
         _, lgbm_results = train_lgbm(metadata)
-        results_list.append(lgbm_results)
+        results_list.extend(lgbm_results)
 
     # ---- Porównanie ----
     if len(results_list) > 1:

@@ -2,8 +2,8 @@
 Architektura MLP z Entity Embeddings dla cech kategorycznych.
 
 Schemat:
-    cat → [Embedding × 9] → concat (165 dim)
-    num (18) + bin (20) + embed (165) → 203 dim wejściowych
+    cat → [Embedding × 8] → concat (160 dim)
+    num (19) + bin (20) + embed (160) → 199 dim wejściowych
     → BatchNorm → [Linear → BN → ReLU → Dropout] × N → Linear(→4)
 """
 
